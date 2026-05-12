@@ -1,4 +1,7 @@
 import asyncio
+import time
+from typing import Callable, Optional
+
 from bleak import BleakScanner, BleakClient
 
 SERVICE_UUID = "6E400001-B5A3-F393-E0E9-E50E24DCCA9E"
@@ -8,10 +11,19 @@ TX_CHAR_UUID = "6E400003-B5A3-F393-E0E9-E50E24DCCA9E"
 GYRO_INTERVAL_MS = 50          # 0 – выключить, иначе интервал в мс
 PING_INTERVAL = 5.0            # секунды
 
+GyroCallback = Optional[Callable[[float, float, float, float], None]]
+
 
 class ESP32Controller:
-    def __init__(self, name="ESP32-C3-Motion"):
+    def __init__(
+        self,
+        name: str = "ESP32-C3-Motion",
+        gyro_callback: GyroCallback = None,
+        verbose_notify: bool = True,
+    ):
         self.name = name
+        self.verbose_notify = verbose_notify
+        self.gyro_callback = gyro_callback
         self.client = None
         self.num_motors = None
         self.response_event = asyncio.Event()
@@ -21,7 +33,8 @@ class ESP32Controller:
 
     def _on_notify(self, sender, data):
         msg = data.decode().strip()
-        print(f"[ESP32] {msg}")
+        if self.verbose_notify:
+            print(f"[ESP32] {msg}")
         if msg.startswith("MOTORS="):
             self.last_response = msg
             self.num_motors = int(msg.split("=")[1])
@@ -30,7 +43,10 @@ class ESP32Controller:
             parts = msg.split(",")
             if len(parts) == 4:
                 _, p, r, y = parts
-                self.last_gyro = (float(p), float(r), float(y))
+                pitch, roll, yaw = float(p), float(r), float(y)
+                self.last_gyro = (pitch, roll, yaw)
+                if self.gyro_callback is not None:
+                    self.gyro_callback(time.monotonic(), pitch, roll, yaw)
         elif msg.startswith(("RECEIVED:", "QUEUE_FULL:", "DONE:", "INVALID:")):
             self.last_response = msg
             self.response_event.set()
@@ -66,6 +82,10 @@ class ESP32Controller:
         await self.client.start_notify(TX_CHAR_UUID, self._on_notify)
         await asyncio.sleep(0.2)   # пауза для подписки
 
+        # Прошивка сбрасывает lastPingTime только по PING; таймаут ~12 с с момента BLE connect.
+        # Отправляем PING до долгих операций (MOTORS/GYRO), иначе при медленном connect возможен разрыв.
+        await self._send_ping_keepalive()
+
         # Запрашиваем количество моторов
         await self.request_motors_count()
         print(f"Connected. Motors: {self.num_motors}")
@@ -76,14 +96,24 @@ class ESP32Controller:
 
         asyncio.create_task(self._ping_loop())
 
+    async def _send_ping_keepalive(self) -> None:
+        if not self.client or not self.client.is_connected:
+            return
+        self.command_counter += 1
+        ping_id = self.command_counter
+        # response=False — не блокировать цикл ожиданием ответа стека BLE; для прошивки достаточно записи RX.
+        await self.client.write_gatt_char(
+            RX_CHAR_UUID,
+            f"PING,{ping_id}".encode(),
+            response=False,
+        )
+
     async def _ping_loop(self):
         while self.client and self.client.is_connected:
             await asyncio.sleep(PING_INTERVAL)
             if not self.client.is_connected:
                 break
-            self.command_counter += 1
-            ping_id = self.command_counter
-            await self.client.write_gatt_char(RX_CHAR_UUID, f"PING,{ping_id}".encode(), response=True)
+            await self._send_ping_keepalive()
 
     async def send_command(self, motor: int, duration_ms: int, max_retries=5):
         if not (1 <= motor <= self.num_motors):
@@ -190,15 +220,8 @@ async def main():
     esp = ESP32Controller()
     try:
         await esp.connect()
-        # await roll_based_motors_loop(esp, duration_ms=300)
-        while True:
-        # Пример: запускаем все моторы по очереди
-            for m in range(6, int(esp.num_motors) + 1):
-                print(f"\n--- Motor {m} ---")
-                ok = await esp.send_command(m, 500)
-                if not ok:
-                    print("Stopping due to failure")
-                    break
+        while esp.client and esp.client.is_connected:
+            await asyncio.sleep(1.0)
     except Exception as e:
         print(f"Error: {e}")
     finally:

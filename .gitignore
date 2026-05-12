@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+ml/dataset/data/*
+!ml/dataset/data/.gitkeep
+ml/gesture_lstm/runs/*
+!ml/gesture_lstm/runs/.gitkeep

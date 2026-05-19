@@ -99,7 +99,7 @@ def _ble_async_main(
             esp = ESP32Controller(name=device_name, gyro_callback=gyro_cb)
             await esp.connect()
             out.put(("connected", True))
-            while not stop_evt.is_set() and esp.client and esp.client.is_connected:
+            while not stop_evt.is_set() and esp.is_connected:
                 await asyncio.sleep(0.05)
         except Exception as e:
             out.put(("error", str(e)))

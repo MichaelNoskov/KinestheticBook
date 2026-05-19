@@ -85,7 +85,7 @@ async def run_live(args: argparse.Namespace) -> None:
         except Exception:
             pass
 
-    esp = ESP32Controller(name=args.device_name, gyro_callback=gyro_cb, verbose_notify=args.verbose_ble)
+    esp = ESP32Controller(name=args.device_name, gyro_callback=gyro_cb)
 
     buf: deque[tuple[float, float, float, float]] = deque(maxlen=int(args.buffer_max))
     last_infer_mono = 0.0
@@ -96,7 +96,7 @@ async def run_live(args: argparse.Namespace) -> None:
     print(f"Сетка: seq_len={seq_len}, grid_dt={grid_dt}s, окно={(seq_len - 1) * grid_dt:.3f}s")
 
     try:
-        while esp.client and esp.client.is_connected:
+        while esp.is_connected:
             try:
                 sample = await asyncio.wait_for(queue.get(), timeout=float(args.tick_sec))
                 buf.append(sample)
@@ -168,7 +168,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick-sec", type=float, default=0.05, help="Таймаут ожидания очереди BLE")
     p.add_argument("--cooldown", type=float, default=1.2, help="Пауза между печатью двух жестов, сек")
     p.add_argument("--conf-threshold", type=float, default=0.55, help="Минимум softmax(confidence) для жеста")
-    p.add_argument("--verbose-ble", action="store_true", help="Печатать каждое BLE-сообщение от контроллера")
+    p.add_argument("--verbose-ble", action="store_true", help=argparse.SUPPRESS)
     return p.parse_args()
 
 

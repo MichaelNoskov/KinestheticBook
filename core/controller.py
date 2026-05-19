@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 from typing import Callable, Optional
 
@@ -8,10 +9,34 @@ SERVICE_UUID = "6E400001-B5A3-F393-E0E9-E50E24DCCA9E"
 RX_CHAR_UUID = "6E400002-B5A3-F393-E0E9-E50E24DCCA9E"
 TX_CHAR_UUID = "6E400003-B5A3-F393-E0E9-E50E24DCCA9E"
 
-GYRO_INTERVAL_MS = 50          # 0 – выключить, иначе интервал в мс
-PING_INTERVAL = 5.0            # секунды
+PING_INTERVAL = 5.0
 
 GyroCallback = Optional[Callable[[float, float, float, float], None]]
+
+_log = logging.getLogger(__name__)
+
+
+class CommandHandle:
+
+    def __init__(self, cmd_id: int, q: "asyncio.Queue[str]", duration_ms: int):
+        self._cmd_id = cmd_id
+        self._q = q
+        self._duration_ms = duration_ms
+
+    async def wait_done(self, timeout: float | None = None) -> bool:
+        if timeout is None:
+            timeout = self._duration_ms / 1000 + 3.0
+        try:
+            msg = await asyncio.wait_for(self._q.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            _log.warning("Timeout waiting DONE for cmd %d", self._cmd_id)
+            return False
+        if msg == "__DISCONNECTED__":
+            return False
+        if msg.startswith("DONE:"):
+            return int(msg.split(":")[1]) == self._cmd_id
+        _log.warning("Unexpected message in wait_done for cmd %d: %s", self._cmd_id, msg)
+        return False
 
 
 class ESP32Controller:
@@ -19,26 +44,43 @@ class ESP32Controller:
         self,
         name: str = "ESP32-C3-Motion",
         gyro_callback: GyroCallback = None,
-        verbose_notify: bool = True,
+        on_connected: Optional[Callable[[], None]] = None,
+        on_disconnected: Optional[Callable[[], None]] = None,
+        auto_reconnect: bool = False,
     ):
         self.name = name
-        self.verbose_notify = verbose_notify
         self.gyro_callback = gyro_callback
-        self.client = None
-        self.num_motors = None
-        self.response_event = asyncio.Event()
-        self.last_response = ""
-        self.command_counter = 0
-        self.last_gyro = None          # (pitch, roll, yaw)
+        self.on_connected = on_connected
+        self.on_disconnected = on_disconnected
+        self.auto_reconnect = auto_reconnect
 
-    def _on_notify(self, sender, data):
+        self.client: Optional[BleakClient] = None
+        self.num_motors: Optional[int] = None
+        self.last_gyro: Optional[tuple[float, float, float]] = None
+
+        self._cmd_counter = 0
+        self._pending: dict[int, asyncio.Queue[str]] = {}
+        self._motors_queue: asyncio.Queue[str] = asyncio.Queue()
+        self._gyro_interval_ms: Optional[int] = None
+        self._reconnecting = False
+        self._shutdown = False
+
+    @property
+    def is_connected(self) -> bool:
+        return bool(self.client and self.client.is_connected)
+
+    def _next_id(self) -> int:
+        self._cmd_counter = (self._cmd_counter % 65535) + 1
+        return self._cmd_counter
+
+    def _on_notify(self, _sender, data: bytes) -> None:
         msg = data.decode().strip()
-        if self.verbose_notify:
-            print(f"[ESP32] {msg}")
+        _log.debug("[ESP32] %s", msg)
+
         if msg.startswith("MOTORS="):
-            self.last_response = msg
             self.num_motors = int(msg.split("=")[1])
-            self.response_event.set()
+            self._motors_queue.put_nowait(msg)
+
         elif msg.startswith("GYRO,"):
             parts = msg.split(",")
             if len(parts) == 4:
@@ -47,186 +89,176 @@ class ESP32Controller:
                 self.last_gyro = (pitch, roll, yaw)
                 if self.gyro_callback is not None:
                     self.gyro_callback(time.monotonic(), pitch, roll, yaw)
-        elif msg.startswith(("RECEIVED:", "QUEUE_FULL:", "DONE:", "INVALID:")):
-            self.last_response = msg
-            self.response_event.set()
 
-    async def _wait_for_motors(self):
-        while True:
-            await self.response_event.wait()
-            self.response_event.clear()
-            if self.last_response.startswith("MOTORS="):
-                self.num_motors = int(self.last_response.split("=")[1])
+        elif msg.startswith(("RECEIVED:", "DONE:", "QUEUE_FULL:", "INVALID:")):
+            try:
+                cmd_id = int(msg.split(":")[1].split(",")[0])
+            except (IndexError, ValueError):
+                _log.warning("Cannot parse ID from: %s", msg)
                 return
+            if cmd_id in self._pending:
+                self._pending[cmd_id].put_nowait(msg)
+                if msg.startswith(("DONE:", "INVALID:")):
+                    del self._pending[cmd_id]
+            else:
+                _log.debug("No pending command for ID %d: %s", cmd_id, msg)
 
-    async def request_motors_count(self, timeout=5.0):
-        await self.client.write_gatt_char(RX_CHAR_UUID, b"MOTORS", response=True)
-        try:
-            await asyncio.wait_for(self._wait_for_motors(), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise Exception("No MOTORS response")
+    def _on_ble_disconnect(self, _client) -> None:
+        _log.warning("BLE disconnected")
+        if self.on_disconnected:
+            self.on_disconnected()
+        for q in self._pending.values():
+            q.put_nowait("__DISCONNECTED__")
+        self._pending.clear()
+        if self.auto_reconnect and not self._shutdown:
+            asyncio.get_event_loop().call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self._reconnect_loop())
+            )
 
-    async def connect(self):
-        print(f"Scanning for '{self.name}'...")
-        devices = await BleakScanner.discover()
-        target = None
-        for d in devices:
-            if d.name and self.name.lower() in d.name.lower():
-                target = d
+    async def _reconnect_loop(self) -> None:
+        if self._reconnecting:
+            return
+        self._reconnecting = True
+        delay = 2.0
+        while not self._shutdown:
+            _log.info("Reconnecting in %.0fs...", delay)
+            await asyncio.sleep(delay)
+            try:
+                await self._do_connect()
+                if self._gyro_interval_ms is not None:
+                    await self.set_gyro_interval(self._gyro_interval_ms)
+                _log.info("Reconnected. Motors: %d", self.num_motors)
+                if self.on_connected:
+                    self.on_connected()
                 break
-        if not target:
-            raise Exception(f"Device '{self.name}' not found")
+            except Exception as e:
+                _log.warning("Reconnect failed: %s", e)
+                delay = min(delay * 2, 30.0)
+        self._reconnecting = False
 
-        self.client = BleakClient(target.address)
+    async def _do_connect(self) -> None:
+        _log.info("Scanning for '%s'...", self.name)
+        devices = await BleakScanner.discover()
+        target = next(
+            (d for d in devices if d.name and self.name.lower() in d.name.lower()),
+            None,
+        )
+        if not target:
+            raise RuntimeError(f"Device '{self.name}' not found")
+
+        self.client = BleakClient(target.address, disconnected_callback=self._on_ble_disconnect)
         await self.client.connect()
         await self.client.start_notify(TX_CHAR_UUID, self._on_notify)
-        await asyncio.sleep(0.2)   # пауза для подписки
+        await asyncio.sleep(0.2)
 
-        # Прошивка сбрасывает lastPingTime только по PING; таймаут ~12 с с момента BLE connect.
-        # Отправляем PING до долгих операций (MOTORS/GYRO), иначе при медленном connect возможен разрыв.
-        await self._send_ping_keepalive()
-
-        # Запрашиваем количество моторов
+        await self._send_ping()
         await self.request_motors_count()
-        print(f"Connected. Motors: {self.num_motors}")
 
-        # Устанавливаем интервал получения данных с гироскопа
-        await self.client.write_gatt_char(RX_CHAR_UUID, f"GYRO,{GYRO_INTERVAL_MS}".encode(), response=True)
-        print(f"Set gyro interval: {GYRO_INTERVAL_MS} ms")
-
+    async def connect(self) -> None:
+        self._shutdown = False
+        await self._do_connect()
+        _log.info("Connected. Motors: %d", self.num_motors)
+        if self.on_connected:
+            self.on_connected()
         asyncio.create_task(self._ping_loop())
 
-    async def _send_ping_keepalive(self) -> None:
-        if not self.client or not self.client.is_connected:
-            return
-        self.command_counter += 1
-        ping_id = self.command_counter
-        # response=False — не блокировать цикл ожиданием ответа стека BLE; для прошивки достаточно записи RX.
-        await self.client.write_gatt_char(
-            RX_CHAR_UUID,
-            f"PING,{ping_id}".encode(),
-            response=False,
-        )
-
-    async def _ping_loop(self):
-        while self.client and self.client.is_connected:
-            await asyncio.sleep(PING_INTERVAL)
-            if not self.client.is_connected:
-                break
-            await self._send_ping_keepalive()
-
-    async def send_command(self, motor: int, duration_ms: int, max_retries=5):
-        if not (1 <= motor <= self.num_motors):
-            print(f"Motor {motor} out of range (1..{self.num_motors})")
-            return False
-        if duration_ms > 1000:
-            print("Duration > 1000 ms not allowed (controller limit)")
-            return False
-
-        retries = 0
-        while retries < max_retries:
-            self.command_counter += 1
-            cmd_id = self.command_counter
-            cmd = f"{cmd_id},{motor},{duration_ms}"
-            await self.client.write_gatt_char(RX_CHAR_UUID, cmd.encode(), response=True)
-
-            try:
-                await asyncio.wait_for(self.response_event.wait(), timeout=3.0)
-                self.response_event.clear()
-            except asyncio.TimeoutError:
-                print(f"No response for {cmd_id}, retry {retries+1}")
-                retries += 1
-                continue
-
-            resp = self.last_response
-            if resp.startswith("INVALID:"):
-                print(f"Command invalid: {resp}")
-                return False
-            elif resp.startswith("QUEUE_FULL:"):
-                _, rest = resp.split(":")
-                ret_id, wait_ms = rest.split(",")
-                if int(ret_id) == cmd_id:
-                    print(f"Queue full, waiting {wait_ms} ms")
-                    await asyncio.sleep(int(wait_ms) / 1000.0)
-                    retries += 1
-                    continue
-            elif resp.startswith("RECEIVED:"):
-                try:
-                    await asyncio.wait_for(self.response_event.wait(), timeout=duration_ms/1000 + 3.0)
-                    self.response_event.clear()
-                except asyncio.TimeoutError:
-                    print(f"Timeout waiting DONE for {cmd_id}")
-                    return False
-                if self.last_response.startswith("DONE:"):
-                    done_id = int(self.last_response.split(":")[1])
-                    if done_id == cmd_id:
-                        print(f"Command {cmd_id} executed successfully")
-                        return True
-                    else:
-                        print(f"Wrong DONE id: {done_id}, expected {cmd_id}")
-                        return False
-                else:
-                    print(f"Unexpected after RECEIVED: {self.last_response}")
-                    return False
-            else:
-                print(f"Unexpected response: {resp}")
-                return False
-
-        print(f"Failed after {max_retries} retries")
-        return False
-
-    async def send_batch(self, commands, delay=0.1):
-        for motor, duration in commands:
-            await self.send_command(motor, duration)
-            await asyncio.sleep(delay)
-
-    async def disconnect(self):
+    async def disconnect(self) -> None:
+        self._shutdown = True
         if self.client and self.client.is_connected:
             await self.client.disconnect()
-            print("Disconnected")
+            _log.info("Disconnected")
 
+    async def set_gyro_interval(self, interval_ms: int) -> None:
+        if not 0 <= interval_ms <= 60000:
+            raise ValueError("interval_ms must be in 0..60000")
+        self._gyro_interval_ms = interval_ms
+        await self.client.write_gatt_char(
+            RX_CHAR_UUID, f"GYRO,{interval_ms}".encode(), response=True
+        )
 
-async def roll_based_motors_loop(controller: ESP32Controller, duration_ms: int = 300):
-    if controller.num_motors is None:
-        print("Motors count unknown. Did you call connect()?")
-        return
+    async def request_motors_count(self, timeout: float = 5.0) -> None:
+        await self.client.write_gatt_char(RX_CHAR_UUID, b"MOTORS", response=True)
+        try:
+            resp = await asyncio.wait_for(self._motors_queue.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise RuntimeError("No MOTORS response")
+        if not resp.startswith("MOTORS="):
+            raise RuntimeError(f"Unexpected response to MOTORS: {resp}")
 
-    num_motors = controller.num_motors
-    total_range = 180.0          # от -90 до 90 = 180 градусов
-    sector_size = total_range / num_motors
-    print(f"Sector size: {sector_size:.1f}°, motors: {num_motors}")
+    async def send_command(
+        self, motor: int, duration_ms: int, max_retries: int = 5
+    ) -> Optional["CommandHandle"]:
+        """Send a motor command and wait for RECEIVED: acknowledgment.
 
-    while controller.client and controller.client.is_connected:
-        # Ожидание первого значения гироскопа
-        while controller.last_gyro is None:
-            await asyncio.sleep(0.05)
-            if not controller.client.is_connected:
-                return
+        Returns a CommandHandle on success (use wait_done() to await completion),
+        or None if the command failed validation, was rejected, or retries exhausted.
+        """
+        if not self.is_connected:
+            _log.warning("send_command called while disconnected")
+            return None
+        if not (1 <= motor <= self.num_motors):
+            _log.warning("Motor %d out of range (1..%d)", motor, self.num_motors)
+            return None
+        if not (1 <= duration_ms <= 1000):
+            _log.warning("duration_ms %d out of range (1..1000)", duration_ms)
+            return None
 
-        pitch, _, _ = controller.last_gyro   # (pitch, roll, yaw)
+        for attempt in range(max_retries):
+            cmd_id = self._next_id()
+            q: asyncio.Queue[str] = asyncio.Queue()
+            self._pending[cmd_id] = q
 
-        # Диапазон pitch [-90..90], приводим к [0..180]
-        pitch_shifted = pitch + 90.0
-        sector_idx = int(pitch_shifted / sector_size)
-        if sector_idx >= num_motors:
-            sector_idx = num_motors - 1
-        motor = sector_idx + 1
+            try:
+                await self.client.write_gatt_char(
+                    RX_CHAR_UUID, f"{cmd_id},{motor},{duration_ms}".encode(), response=True
+                )
+            except Exception as e:
+                _log.warning("Write failed for cmd %d: %s", cmd_id, e)
+                self._pending.pop(cmd_id, None)
+                return None
 
-        print(f"Pitch: {pitch:.1f}° -> motor {motor} (sector {sector_idx+1}/{num_motors})")
-        await controller.send_command(motor, duration_ms)
+            try:
+                resp = await asyncio.wait_for(q.get(), timeout=3.0)
+            except asyncio.TimeoutError:
+                _log.warning("No response for cmd %d, attempt %d", cmd_id, attempt + 1)
+                self._pending.pop(cmd_id, None)
+                continue
 
+            if resp == "__DISCONNECTED__":
+                return None
 
-async def main():
-    esp = ESP32Controller()
-    try:
-        await esp.connect()
-        while esp.client and esp.client.is_connected:
-            await asyncio.sleep(1.0)
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        await esp.disconnect()
+            if resp.startswith("INVALID:"):
+                _log.error("Command rejected as invalid: %s", resp)
+                return None
 
+            if resp.startswith("QUEUE_FULL:"):
+                _, rest = resp.split(":")
+                ret_id, wait_ms = rest.split(",")
+                self._pending.pop(cmd_id, None)
+                if int(ret_id) == cmd_id:
+                    _log.debug("Queue full, waiting %s ms", wait_ms)
+                    await asyncio.sleep(int(wait_ms) / 1000.0)
+                continue
 
-if __name__ == "__main__":
-    asyncio.run(main())
+            if resp.startswith("RECEIVED:"):
+                return CommandHandle(cmd_id, q, duration_ms)
+
+            _log.warning("Unexpected response: %s", resp)
+            self._pending.pop(cmd_id, None)
+            return None
+
+        _log.error("Failed after %d retries", max_retries)
+        return None
+
+    async def _send_ping(self) -> None:
+        if not self.client or not self.client.is_connected:
+            return
+        await self.client.write_gatt_char(
+            RX_CHAR_UUID, f"PING,{self._next_id()}".encode(), response=False
+        )
+
+    async def _ping_loop(self) -> None:
+        while not self._shutdown and self.is_connected:
+            await asyncio.sleep(PING_INTERVAL)
+            if self.is_connected:
+                await self._send_ping()

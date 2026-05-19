@@ -112,7 +112,7 @@ async def run_collection(
 
     async def watcher():
         try:
-            while esp.client and esp.client.is_connected:
+            while esp.is_connected:
                 await asyncio.sleep(0.5)
         finally:
             stop_event.set()

@@ -1,6 +1,6 @@
 from .controller import (
+    CommandHandle,
     ESP32Controller,
-    GYRO_INTERVAL_MS,
     PING_INTERVAL,
     RX_CHAR_UUID,
     SERVICE_UUID,
@@ -8,8 +8,8 @@ from .controller import (
 )
 
 __all__ = [
+    "CommandHandle",
     "ESP32Controller",
-    "GYRO_INTERVAL_MS",
     "PING_INTERVAL",
     "RX_CHAR_UUID",
     "SERVICE_UUID",
